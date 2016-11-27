@@ -18,29 +18,32 @@ import com.visellico.rainecloud.serialization.RCObject;
 import com.visellico.rainecloud.serialization.RCString;
 import com.visellico.rainecloud.serialization.Type;
 
+
 public class Server {
 
 	//read only
 	private int port;
 	private Thread listenThread;
 	private Thread consoleThread;
+	private Thread runThread;
 	private boolean listening = false;	//NEVERMIND volatile, cmopiler won't optimize out specific things
 	private boolean consoling = false;	//hahahaha
+	private boolean running = false;
 	//DataGram is the UDP api, Socket is TCP (up to our implementation, can do either)
 	private DatagramSocket socket;		//Our computer is an apartment building, our socket is the mailbox. We leave our mail there, and we get our mail there.
 	private final int MAX_PACKET_SIZE = 1024;
 	private byte[] receivedDataBuffer = new byte[MAX_PACKET_SIZE * 10];	//i.e, we have ten sections all of 1024 which we can stuff packets into, up to 10.
 	
+	//Indicates the type of packet that is being sent
+	private final String PROTOCOL = "protocol";
+	private final RCField PROTOCOL_CNXN_CHECK = RCField.Byte(PROTOCOL, (byte) 0x0C);
+		
 	//Right I had too much fun with this
 	//	Read the java doc for information on what is going on here
 	private SimpleDateFormat sdf = new SimpleDateFormat("EEEE, MMM dd, yyyy, 'at' HH:mm:ss z");
-	
-	//Hooray for O(1) lookup times
-	//TO-DO Note we may need to change this to a hashmap with k,v pairs so we can look up individual clients. Though, that shouldn't matter.
+	SimpleDateFormat hourMinSec = new SimpleDateFormat("HH:mm:ss");
 	
 	private List<ServerClient> clients = new ArrayList<>();
-//	private Set<ServerClient> clients = new HashSet<ServerClient>();
-//	private Iterator<ServerClient> it = clients.iterator();
 	
 	/**
 	 * Instance of the rain server
@@ -75,8 +78,11 @@ public class Server {
 		listenThread = new Thread(() -> listen(), "RainCloudServer-ListenThread");	//lambda (runnable target), name
 		listenThread.start();
 		
-		consoleThread = new Thread(() -> runConsole(), "RainCloudServer-ConsoleThread");	//interactable component to the server
+		consoleThread = new Thread(() -> runConsole(), "RainCloudServer-ConsoleThread");	//interactable component to the server- allows console input
 		consoleThread.start();
+		
+		runThread = new Thread(() -> serverCycle(), "RainCloudServer-ServerThread");
+		runThread.start();
 		
 		System.out.println("Server is listening...");
 		
@@ -106,13 +112,11 @@ public class Server {
 		RCObject obj;
 		byte[] data;
 		
-		SimpleDateFormat hourMinSec = new SimpleDateFormat("HH:mm:ss");
 		Date date = null;
 		while (consoling) {	
 			try {
 				input = br.readLine();
 			} catch (IOException e) {
-				
 				System.out.println("A terrible thing has happened in com.visellico.raineserver.Server");
 			}
 			date = new Date(System.currentTimeMillis());
@@ -130,16 +134,44 @@ public class Server {
 			db.getBytes(data, 0);
 			
 			System.out.println("[" + timeStamp + "] " + input);
-			for (ServerClient c : clients) {
-				send(data, c);
-				System.out.println("\tdata sent");
-			}
-			
-//			send(new byte[] {42}, c);
-			//TODO broadcast to each client the message and timestamp
-			
+			broadcast(data);
+						
 		}
 		
+	}
+	
+	private void serverCycle() {
+		//Essentially send connection packets every 10 seconds
+		
+		running = true;
+		
+		RCDatabase db = new RCDatabase("cnxncheck");
+		RCObject obj = new RCObject("obj");
+		obj.addField(PROTOCOL_CNXN_CHECK);
+		db.addObject(obj);
+		byte[] connectionCheck = new byte[db.getSize()];
+		
+		db.getBytes(connectionCheck, 0);
+		
+		long lastTime = System.currentTimeMillis();
+		long currentTime;
+		
+		while (running) {
+			currentTime = System.currentTimeMillis();
+			if (currentTime - lastTime > 1000) {
+//				System.out.println("[" + hourMinSec.format(currentTime) + "] Sending sanity check");
+				broadcast(connectionCheck);
+				lastTime = currentTime;
+				
+				for (int i = 0; i < clients.size(); i++) {
+					if (!clients.get(i).isConnected()) {
+						clients.remove(i);
+						System.out.println("Client disconnected");
+					}
+				}
+			}
+			
+		}
 	}
 	
 	private void process(DatagramPacket packet) {
@@ -150,35 +182,89 @@ public class Server {
 		InetAddress address = packet.getAddress();
 		int port = packet.getPort();
 		
+		ServerClient c = getConnectedClient(address, port);
+		
 		if (new String(data, 0, 4).equals("RCDB")) {	//scould just compare the bytes lol
 			RCDatabase database = RCDatabase.Deserialize(data);
 			//Ugh code is all over the place today
-			process(database);
+			process(database, packet);
 		} else if (data[0] == 0x7f && data[1] == 0x7f) {
-			//Not a database
-			//This is an example of how we might treat other packets. But we migth as well package everything in an RCDatabase
-			dump(packet);
+			
 			switch (data[2]) {
-			case 1: //connection packet
-				System.out.println("CLIENT CONNECTED");
+			case PacketType.PACKET_CONNECTION: //connection packet
+				System.out.println("Client connected");
 //				clients.add(new ServerClient(packet.getAddress(), packet.getPort()));
-				ServerClient c = new ServerClient(packet.getAddress(), packet.getPort());
+				c.refreshConnected();
 				clients.add(c);
-				System.out.println(clients.size());
+				
+				//Confirmation packet
 				send(new byte[] {42}, c);
 				break;
-			case 2: //ping
+			case PacketType.PACKET_REFRESH_CONNECTION: //Client refreshing connection
+				c.refreshConnected();
+//				for (ServerClient c1 : clients) {
+//					if (c.equals(c1)) c1.refreshConnected();
+//				}
 				break;
-			case 3: //ping
-				default: System.out.println("Unknown connection");
+				default: System.out.println("Unknown packet");
 			}
 		}
 		
 	}
 	
-	private void process(RCDatabase database) {
+	private void process(RCDatabase database, DatagramPacket packet) {
 		System.out.println("Received database");
+		
+		InetAddress address = packet.getAddress();
+		int port = packet.getPort();
+		ServerClient c = getConnectedClient(address, port);
+		
+		if (database.getName().equals("username")) {
+			System.out.println("Server: SENDING NEW CLIENT");
+			//Lol that is a lot of work for one string
+			c.userName = database.objects.get(0).strings.get(0).getString();
+			
+			RCDatabase userConnected = new RCDatabase("userConnected");
+			RCObject client = new RCObject("client");
+			client.addField(RCField.Int("userclass", 1));	//value one for Mage
+			client.addString(RCString.Create("username", c.userName));
+			userConnected.addObject(client);
+			
+			broadcast(userConnected);
+			
+		}
+		
 		dump(database);
+	}
+	
+	public ServerClient getConnectedClient(InetAddress address, int port) {
+		ServerClient c = new ServerClient(address, port);
+		
+		//If the client is already connected
+		for (ServerClient c1 : clients) {
+			if (c.equals(c1)) c = c1;
+		}
+		return c;
+	}
+	
+	/**
+	 * Sends data to every connected client
+	 * @param data
+	 */
+	public void broadcast(byte[] data) {
+		for (ServerClient c : clients) {
+			send(data, c);
+		}
+	}
+	
+	/**
+	 * Sends a databse to every connected client
+	 * @param data
+	 */
+	public void broadcast(RCDatabase db) {
+		byte[] data = new byte[db.getSize()];
+		db.getBytes(data, 0);
+		broadcast(data);
 	}
 
 	public void send(byte[] data, ServerClient client) {
@@ -259,8 +345,13 @@ public class Server {
 					break;
 				}
 				System.out.println("\t\tData: " + data);
-				System.out.println("");
 
+			}
+			for (RCString string : object.strings) {
+				System.out.println("\t\tString");
+				System.out.println("\t\tName: " + string.getName());
+				System.out.println("\t\tSize: " + string.getSize());
+				System.out.println("\t\tVal: " + string.getString());
 			}
 			System.out.println("");
 
